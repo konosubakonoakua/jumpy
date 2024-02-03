@@ -1,195 +1,210 @@
-//! Audio & music plugin.
-//!
-//! Audio playback in Jumpy is powered by [`bevy_kira_audio`]. This module sets up the audio plugin,
-//! and installs our [`MusicChannel`] and [`EffectsChannel`] for playing music and sound effects.
-//!
-//! Also in this module is the [`music_system`] which handles playing the right music in different
-//! game states.
-//!
-//! Game sounds are _not_ handled here. Game sounds events are created in
-//! [`jumpy_core`][::jumpy_core] and then processed and sent to the effects channel by the
-//! [`play_sounds()`][crate::session::play_sounds] system.
-//!
-//! [`bevy_kira_audio`]: https://docs.rs/bevy_kira_audio
+use std::collections::VecDeque;
 
-use std::time::Duration;
-
-use bevy_kira_audio::{
-    AudioApp, AudioChannel, AudioControl, AudioInstance, AudioSource, PlaybackState,
+use bones_framework::prelude::kira::{
+    sound::{
+        static_sound::{StaticSoundHandle, StaticSoundSettings},
+        PlaybackState,
+    },
+    tween::{self, Tween},
+    Volume,
 };
-use rand::{seq::SliceRandom, thread_rng};
 
-use crate::{main_menu::MenuPage, metadata::GameMeta, prelude::*};
+use crate::prelude::*;
 
-/// Audio & Music plugin.
-pub struct JumpyAudioPlugin;
+pub mod music;
 
-impl Plugin for JumpyAudioPlugin {
-    fn build(&self, app: &mut App) {
-        app.add_plugin(bevy_kira_audio::AudioPlugin)
-            .init_resource::<MusicState>()
-            .init_resource::<ShuffledPlaylist>()
-            .add_audio_channel::<MusicChannel>()
-            .add_audio_channel::<EffectsChannel>()
-            .add_startup_system(setup_audio_defaults)
-            .add_system(music_system.run_if(resource_exists::<GameMeta>()));
+pub use music::*;
+
+pub fn game_plugin(game: &mut Game) {
+    game.init_shared_resource::<AudioCenter>();
+
+    let session = game.sessions.create(SessionNames::AUDIO);
+
+    // Audio doesn't do any rendering
+    session.visible = false;
+    session
+        .stages
+        .add_system_to_stage(First, music_system)
+        .add_system_to_stage(First, process_audio_events)
+        .add_system_to_stage(Last, kill_finished_audios);
+}
+
+/// A resource that can be used to control game audios.
+#[derive(HasSchema)]
+#[schema(no_clone)]
+pub struct AudioCenter {
+    /// Buffer for audio events that have not yet been processed.
+    events: VecDeque<AudioEvent>,
+    /// The handle to the current music.
+    music: Option<Audio>,
+}
+
+impl Default for AudioCenter {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::with_capacity(16),
+            music: None,
+        }
     }
 }
 
-/// Marker struct for the music audio channel.
-#[derive(Resource)]
-pub struct MusicChannel;
+impl AudioCenter {
+    /// Push an audio event to the queue for later processing.
+    pub fn event(&mut self, event: AudioEvent) {
+        self.events.push_back(event);
+    }
 
-/// Marker struct for the effects audio channel.
-#[derive(Resource)]
-pub struct EffectsChannel;
+    /// Get the playback state of the music.
+    pub fn music_state(&self) -> Option<PlaybackState> {
+        self.music.as_ref().map(|m| m.handle.state())
+    }
 
-/// The music playback state.
-#[derive(Resource, Clone, Debug, Default)]
-pub enum MusicState {
-    /// Music is not playing.
-    #[default]
-    None,
-    /// Playing the main menu music.
-    MainMenu(Handle<AudioInstance>),
-    /// Playing the character select music.
-    CharacterSelect(Handle<AudioInstance>),
-    /// Playing the credits music.
-    Credits(Handle<AudioInstance>),
-    /// Playing the fight music.
-    Fight {
-        /// The handle to the audio instance.
-        instance: Handle<AudioInstance>,
-        /// The index of the song in the shuffled playlist.
-        idx: usize,
+    /// Play a sound. These are usually short audios that indicate something
+    /// happened in game, e.g. a player jump, an explosion, etc.
+    pub fn play_sound(&mut self, sound_source: Handle<AudioSource>, volume: f64) {
+        self.events.push_back(AudioEvent::PlaySound {
+            sound_source,
+            volume,
+        })
+    }
+
+    /// Play some music. These may or may not loop.
+    ///
+    /// Any current music is stopped.
+    pub fn play_music(
+        &mut self,
+        sound_source: Handle<AudioSource>,
+        sound_settings: StaticSoundSettings,
+    ) {
+        self.events.push_back(AudioEvent::PlayMusic {
+            sound_source,
+            sound_settings: Box::new(sound_settings),
+        });
+    }
+}
+
+/// An audio event that may be sent to the [`AudioCenter`] resource for
+/// processing.
+#[derive(Clone, Debug)]
+pub enum AudioEvent {
+    /// Update the volume of all audios using the new values.
+    VolumeChange {
+        main_volume: f64,
+        music_volume: f64,
+        effects_volume: f64,
+    },
+    /// Play some music.
+    ///
+    /// Any current music is stopped.
+    PlayMusic {
+        /// The handle for the music.
+        sound_source: Handle<AudioSource>,
+        /// The settings for the music.
+        sound_settings: Box<StaticSoundSettings>,
+    },
+    /// Play a sound.
+    PlaySound {
+        /// The handle to the sound to play.
+        sound_source: Handle<AudioSource>,
+        /// The volume to play the sound at.
+        volume: f64,
     },
 }
 
-impl MusicState {
-    /// Get the current audio instance, if one is contained.
-    fn current_instance(&self) -> Option<&Handle<AudioInstance>> {
-        match self {
-            MusicState::None => None,
-            MusicState::MainMenu(i) => Some(i),
-            MusicState::CharacterSelect(i) => Some(i),
-            MusicState::Credits(i) => Some(i),
-            MusicState::Fight { instance, .. } => Some(instance),
-        }
-    }
+#[derive(HasSchema)]
+#[schema(no_clone, no_default, opaque)]
+#[repr(C)]
+pub struct Audio {
+    /// The handle for the audio.
+    handle: StaticSoundHandle,
+    /// The original volume requested for the audio.
+    volume: f64,
 }
 
-/// Bevy resource containing the in-game music playlist shuffled.
-#[derive(Resource, Deref, DerefMut, Clone, Debug, Default)]
-pub struct ShuffledPlaylist(pub Vec<AssetHandle<AudioSource>>);
-
-/// Sets the default music and effects volume.
-///
-/// TODO: make this configurable in the settings menu.
-fn setup_audio_defaults(
-    music: Res<AudioChannel<MusicChannel>>,
-    effects: Res<AudioChannel<EffectsChannel>>,
+fn process_audio_events(
+    mut audio_manager: ResMut<AudioManager>,
+    mut audio_center: ResMut<AudioCenter>,
+    assets: ResInit<AssetServer>,
+    mut entities: ResMut<Entities>,
+    mut audios: CompMut<Audio>,
+    storage: Res<Storage>,
 ) {
-    music.set_volume(0.22);
-    effects.set_volume(0.1);
-}
+    let settings = storage.get::<Settings>().unwrap();
 
-/// The amount of time to spend fading the music in and out.
-const MUSIC_FADE_DURATION: Duration = Duration::from_millis(500);
-
-/// System that plays music according to the game mode.
-fn music_system(
-    game: Res<GameMeta>,
-    mut shuffled_fight_music: ResMut<ShuffledPlaylist>,
-    mut music_state: ResMut<MusicState>,
-    mut audio_instances: ResMut<Assets<AudioInstance>>,
-    music: Res<AudioChannel<MusicChannel>>,
-    engine_state: Res<State<EngineState>>,
-    menu_page: Res<MenuPage>,
-) {
-    if shuffled_fight_music.is_empty() || engine_state.is_changed() {
-        let mut songs = game.music.fight.clone();
-        songs.shuffle(&mut thread_rng());
-        **shuffled_fight_music = songs;
-    }
-
-    match engine_state.0 {
-        EngineState::LoadingPlatformStorage | EngineState::LoadingGameData => (),
-        EngineState::InGame => {
-            if let MusicState::Fight { instance, idx } = &mut *music_state {
-                let inst = audio_instances.get(instance).unwrap();
-                if let PlaybackState::Stopped = inst.state() {
-                    *idx += 1;
-                    *idx %= shuffled_fight_music.len();
-
-                    *instance = music
-                        .play(shuffled_fight_music[*idx].inner.clone_weak())
-                        .linear_fade_in(MUSIC_FADE_DURATION)
-                        .handle();
+    for event in audio_center.events.drain(..).collect::<Vec<_>>() {
+        match event {
+            AudioEvent::VolumeChange {
+                main_volume,
+                music_volume,
+                effects_volume,
+            } => {
+                let tween = Tween::default();
+                // Update music volume
+                if let Some(music) = &mut audio_center.music {
+                    let volume = main_volume * music_volume * music.volume;
+                    if let Err(err) = music.handle.set_volume(volume, tween) {
+                        warn!("Error setting music volume: {err}");
+                    }
                 }
-            } else {
-                if let Some(instance) = music_state.current_instance() {
-                    let instance = audio_instances.get_mut(instance).unwrap();
-                    instance.stop(AudioTween::linear(MUSIC_FADE_DURATION));
+                // Update sound volumes
+                for audio in audios.iter_mut() {
+                    let volume = main_volume * effects_volume * audio.volume;
+                    if let Err(err) = audio.handle.set_volume(volume, tween) {
+                        warn!("Error setting audio volume: {err}");
+                    }
                 }
-
-                if let Some(song) = shuffled_fight_music.get(0) {
-                    *music_state = MusicState::Fight {
-                        instance: music
-                            .play(song.inner.clone_weak())
-                            .linear_fade_in(MUSIC_FADE_DURATION)
-                            .looped()
-                            .handle(),
-                        idx: 0,
+            }
+            AudioEvent::PlayMusic {
+                sound_source,
+                mut sound_settings,
+            } => {
+                // Stop the current music
+                if let Some(mut music) = audio_center.music.take() {
+                    let tween = Tween {
+                        start_time: kira::StartTime::Immediate,
+                        duration: MUSIC_FADE_DURATION,
+                        easing: tween::Easing::Linear,
                     };
+                    music.handle.stop(tween).unwrap();
+                }
+                // Scale the requested volume by the settings value
+                let volume = match sound_settings.volume {
+                    tween::Value::Fixed(vol) => vol.as_amplitude(),
+                    _ => MUSIC_VOLUME,
+                };
+                let scaled_volume = settings.main_volume * settings.music_volume * volume;
+                sound_settings.volume = tween::Value::Fixed(Volume::Amplitude(scaled_volume));
+                // Play the new music
+                let sound_data = assets.get(sound_source).with_settings(*sound_settings);
+                match audio_manager.play(sound_data) {
+                    Err(err) => warn!("Error playing music: {err}"),
+                    Ok(handle) => audio_center.music = Some(Audio { handle, volume }),
+                }
+            }
+            AudioEvent::PlaySound {
+                sound_source,
+                volume,
+            } => {
+                let scaled_volume = settings.main_volume * settings.effects_volume * volume;
+                let sound_data = assets
+                    .get(sound_source)
+                    .with_settings(StaticSoundSettings::default().volume(scaled_volume));
+                match audio_manager.play(sound_data) {
+                    Err(err) => warn!("Error playing sound: {err}"),
+                    Ok(handle) => {
+                        let audio_ent = entities.create();
+                        audios.insert(audio_ent, Audio { handle, volume });
+                    }
                 }
             }
         }
-        EngineState::MainMenu => match &*menu_page {
-            MenuPage::PlayerSelect | MenuPage::MapSelect { .. } | MenuPage::NetworkGame => {
-                if !matches!(*music_state, MusicState::CharacterSelect(..)) {
-                    if let Some(instance) = music_state.current_instance() {
-                        let instance = audio_instances.get_mut(instance).unwrap();
-                        instance.stop(AudioTween::linear(MUSIC_FADE_DURATION));
-                    }
-                    *music_state = MusicState::CharacterSelect(
-                        music
-                            .play(game.music.character_screen.inner.clone_weak())
-                            .linear_fade_in(MUSIC_FADE_DURATION)
-                            .looped()
-                            .handle(),
-                    );
-                }
-            }
-            MenuPage::Home | MenuPage::Settings => {
-                if !matches!(*music_state, MusicState::MainMenu(..)) {
-                    if let Some(instance) = music_state.current_instance() {
-                        let instance = audio_instances.get_mut(instance).unwrap();
-                        instance.stop(AudioTween::linear(MUSIC_FADE_DURATION));
-                    }
-                    *music_state = MusicState::MainMenu(
-                        music
-                            .play(game.music.title_screen.inner.clone_weak())
-                            .linear_fade_in(MUSIC_FADE_DURATION)
-                            .looped()
-                            .handle(),
-                    );
-                }
-            }
-            MenuPage::Credits => {
-                if !matches!(*music_state, MusicState::Credits(..)) {
-                    if let Some(instance) = music_state.current_instance() {
-                        let instance = audio_instances.get_mut(instance).unwrap();
-                        instance.stop(AudioTween::linear(MUSIC_FADE_DURATION));
-                    }
-                    *music_state = MusicState::Credits(
-                        music
-                            .play(game.music.credits.inner.clone_weak())
-                            .linear_fade_in(MUSIC_FADE_DURATION)
-                            .looped()
-                            .handle(),
-                    );
-                }
-            }
-        },
+    }
+}
+
+fn kill_finished_audios(entities: Res<Entities>, audios: Comp<Audio>, mut commands: Commands) {
+    for (audio_ent, audio) in entities.iter_with(&audios) {
+        if audio.handle.state() == PlaybackState::Stopped {
+            commands.add(move |mut entities: ResMut<Entities>| entities.kill(audio_ent));
+        }
     }
 }

@@ -1,58 +1,70 @@
-//! Debugging tools.
-//!
-//! Sets up the Bevy world inspector, and the puffin profiler.
-//!
-//! More debug related ui code can be found in [`ui::debug_tools`].
+//! Debug tools and menus.
 
 use crate::prelude::*;
-use bevy::window::PrimaryWindow;
-use bevy_egui::EguiContext;
-use bevy_inspector_egui::{bevy_inspector, inspector_egui_impls};
 
-/// Debug plugin.
-pub struct JumpyDebugPlugin;
-
-/// Resource that tracks whether or not the world inspector window is visible.
-#[derive(Resource, Deref, DerefMut, Default)]
-pub struct WorldInspectorEnabled(pub bool);
-
-impl Plugin for JumpyDebugPlugin {
-    fn build(&self, app: &mut App) {
-        app.init_resource::<WorldInspectorEnabled>()
-            .add_system(world_inspector)
-            .add_system(
-                (|| {
-                    profiling::mark_new_frame();
-                })
-                .in_base_set(CoreSet::Last),
-            );
-
-        let type_registry = app.world.resource::<bevy::app::AppTypeRegistry>();
-        let mut type_registry = type_registry.write();
-
-        inspector_egui_impls::register_std_impls(&mut type_registry);
-        inspector_egui_impls::register_glam_impls(&mut type_registry);
-        inspector_egui_impls::register_bevy_impls(&mut type_registry);
-    }
+pub fn game_plugin(game: &mut Game) {
+    game.sessions
+        .create(SessionNames::DEBUG)
+        .install_plugin(session_plugin);
 }
 
-/// Renders the world-inspector UI.
-pub fn world_inspector(world: &mut World) {
-    if !**world.resource::<WorldInspectorEnabled>() {
-        return;
+fn session_plugin(session: &mut Session) {
+    session
+        .stages
+        .add_system_to_stage(CoreStage::First, debug_menu);
+}
+
+#[derive(HasSchema, Clone, Debug, Default)]
+struct DebugMenuState {
+    pub show_menu: bool,
+    pub snapshot: Option<World>,
+}
+
+fn debug_menu(
+    mut sessions: ResMut<Sessions>,
+    keyboard_inputs: Res<KeyboardInputs>,
+    mut state: ResMutInit<DebugMenuState>,
+    ctx: ResMut<EguiCtx>,
+    localization: Localization<GameMeta>,
+) {
+    let DebugMenuState {
+        snapshot,
+        show_menu,
+    } = &mut *state;
+
+    let toggle_debug = keyboard_inputs
+        .key_events
+        .iter()
+        .any(|x| x.key_code.option() == Some(KeyCode::F12) && !x.button_state.pressed());
+
+    if toggle_debug {
+        *show_menu = !*show_menu;
+    }
+    let game_session = sessions.get_mut(SessionNames::GAME);
+
+    // Delete the snapshot if there is one and we are not in the middle of a game.
+    if game_session.is_none() && snapshot.is_some() {
+        *snapshot = None;
     }
 
-    let mut egui_context = world
-        .query_filtered::<&mut EguiContext, With<PrimaryWindow>>()
-        .single(world)
-        .clone();
+    egui::Window::new(localization.get("debug-tools"))
+        .id(egui::Id::from("debug"))
+        .open(show_menu)
+        .show(&ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_enabled(game_session.is_some());
 
-    egui::Window::new("World Inspector")
-        .default_size(egui::vec2(400.0, 400.0))
-        .show(egui_context.get_mut(), |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                bevy_inspector::ui_for_world(world, ui);
-                ui.allocate_space(ui.available_size());
-            });
+                if ui.button(localization.get("take-snapshot")).clicked() {
+                    if let Some(session) = game_session {
+                        *snapshot = Some(session.snapshot());
+                    }
+                } else if ui.button(localization.get("restore-snapshot")).clicked() {
+                    if let Some(session) = game_session {
+                        if let Some(mut snapshot) = snapshot.clone() {
+                            session.restore(&mut snapshot);
+                        }
+                    }
+                }
+            })
         });
 }

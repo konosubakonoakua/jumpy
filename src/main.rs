@@ -1,35 +1,38 @@
-#![doc = include_str!("./README.md")]
 #![doc(html_logo_url = "https://avatars.githubusercontent.com/u/87333478?s=200&v=4")]
 // This cfg_attr is needed because `rustdoc::all` includes lints not supported on stable
 #![cfg_attr(doc, allow(unknown_lints))]
 #![deny(rustdoc::all)]
-#![allow(rustdoc::private_intra_doc_links)]
-#![allow(clippy::type_complexity)]
-#![allow(clippy::forget_non_drop)]
 #![allow(clippy::too_many_arguments)]
+// TODO: Warn on dead code.
+// This is temporarily disabled while migrating to the new bones.
+#![allow(dead_code)]
+#![allow(ambiguous_glob_reexports)]
+#![doc = include_str!("./README.md")]
 
-/// Sets the global Rust allocator to MiMalloc instead of the system one.
-///
-/// Doesn't do anything on WASM builds. ( We may want an alternative allocator for WASM later. )
-#[cfg(not(target_arch = "wasm32"))]
-#[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+use bones_bevy_renderer::BonesBevyRenderer;
+use bones_framework::prelude::*;
 
-/// External crate documentation.
-///
-/// This module only exists during docs builds and serves to make it eaiser to link to relevant
-/// documentation in external crates.
-#[cfg(doc)]
-pub mod external {
-    #[doc(inline)]
-    pub use bevy;
-    #[doc(inline)]
-    pub use bevy_egui::egui;
-    #[doc(inline)]
-    pub use bones_matchmaker_proto;
-    #[doc(inline)]
-    pub use ggrs;
+pub mod audio;
+pub mod core;
+pub mod debug;
+pub mod fullscreen;
+pub mod input;
+pub mod profiler;
+pub mod sessions;
+pub mod settings;
+pub mod ui;
+
+mod prelude {
+    pub use crate::{
+        audio::*, core::prelude::*, impl_system_param, input::*, sessions::*, settings::*, GameMeta,
+    };
+    pub use bones_framework::prelude::*;
+    pub use once_cell::sync::Lazy;
+    pub use serde::{Deserialize, Serialize};
+    pub use std::{sync::Arc, time::Duration};
+    pub use tracing::{debug, error, info, trace, warn};
 }
+use crate::prelude::*;
 
 // This will cause Bevy to be dynamically linked during development,
 // which can greatly reduce re-compile times in some circumstances.
@@ -38,109 +41,179 @@ pub mod external {
 #[allow(clippy::single_component_path_imports)]
 use bevy_dylib;
 
-pub mod assets;
-pub mod audio;
-pub mod bevy_states;
-pub mod config;
-pub mod console;
-pub mod debug;
-pub mod input;
-pub mod loading;
-pub mod localization;
-pub mod logs;
-pub mod metadata;
-pub mod platform;
-pub mod profiling;
-pub mod puffin_tracing;
-pub mod session;
-pub mod ui;
-pub mod utils;
+#[derive(HasSchema, Clone, Debug, Default)]
+#[type_data(metadata_asset("game"))]
+#[repr(C)]
+pub struct GameMeta {
+    pub plugins: SVec<Handle<LuaPlugin>>,
+    pub core: CoreMeta,
+    pub default_settings: settings::Settings,
+    pub localization: Handle<LocalizationAsset>,
+    pub theme: ui::UiTheme,
+    pub main_menu: ui::main_menu::MainMenuMeta,
+    pub music: GameMusic,
+}
 
-pub mod camera;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod networking;
-pub mod prelude;
-use prelude::*;
+#[derive(HasSchema, Clone, Debug, Default)]
+#[type_data(metadata_asset("assets"))]
+#[repr(C)]
+pub struct PackMeta {
+    pub plugins: SVec<Handle<LuaPlugin>>,
+    pub map_tilesets: SVec<Handle<Atlas>>,
+    pub players: SVec<Handle<PlayerMeta>>,
+    pub player_hats: SVec<Handle<HatMeta>>,
+    pub maps: SVec<Handle<MapMeta>>,
+    pub map_elements: SVec<Handle<ElementMeta>>,
+}
 
-/// The entrypoint function for the jumpy game.
-///
-/// This function:
-///
-/// - Parses engine config:
-///     - On native: commandline arguments
-///     - On web: query string parameters
-/// - Initializes the Bevy [`App`]
-/// - Initializes settings and resources
-/// - Installs our Bevy plugins
-///     - This includes 3rd party plugins, and our custom bevy plugins
-///     - Nearly all of the game logic resides in these plugins
-/// - Starts the game
-pub fn main() {
-    // Load engine config. This will parse CLI arguments or web query string so we want to do it
-    // before we create the app to make sure everything is in order.
-    let engine_config = Lazy::force(&config::ENGINE_CONFIG);
+impl GameMeta {
+    /// Get the lua plugins loaded by the game.
+    pub fn get_plugins(&self, asset_server: &AssetServer) -> Arc<Vec<Handle<LuaPlugin>>> {
+        let mut plugins = Vec::new();
+        plugins.extend(self.plugins.iter().copied());
+        plugins.extend(
+            self.core
+                .map_elements
+                .iter()
+                .map(|eh| asset_server.get(*eh).plugin)
+                .filter(|plugin_handle| plugin_handle != &Handle::default()),
+        );
 
-    let mut app = App::new();
+        for pack in asset_server.packs() {
+            let pack_meta = asset_server.get(pack.root.typed::<PackMeta>());
+            plugins.extend(pack_meta.plugins.iter().copied());
+            plugins.extend(
+                pack_meta
+                    .map_elements
+                    .iter()
+                    .map(|eh| asset_server.get(*eh).plugin)
+                    .filter(|plugin_handle| plugin_handle != &Handle::default()),
+            );
+        }
+        Arc::new(plugins)
+    }
+}
 
-    app
-        // Initialize resources
-        .insert_resource(ClearColor(Color::BLACK))
-        // Set initial game state
-        .add_state::<EngineState>()
-        .add_state::<InGameState>()
-        .add_state::<GameEditorState>()
-        // Install plugins
-        //
-        // Log plugin is added first to ensure console_error_panic_hook is set early on,
-        // otherwise in wasm an exception may occur without being logged to browser console.
-        .add_plugin(JumpyLogPlugin {
-            filter: engine_config.log_level.clone(),
-            ..default()
-        })
-        .add_plugins(
-            DefaultPlugins
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "Fish Folk: Jumpy".to_string(),
-                        fit_canvas_to_parent: true,
-                        ..default()
-                    }),
-                    ..default()
-                })
-                .set(ImagePlugin::default_nearest())
-                .set(bevy::asset::AssetPlugin {
-                    watch_for_changes: engine_config.hot_reload,
-                    asset_folder: engine_config
-                        .asset_dir
-                        .clone()
-                        .unwrap_or_else(|| "assets".into()),
-                })
-                // We are using JumpyLogPlugin, disabled to avoid conflicts in global logging/tracing.
-                .disable::<bevy::log::LogPlugin>(),
-        )
-        .add_plugin(bevy_tweening::TweeningPlugin)
-        .add_plugin(bevy_framepace::FramepacePlugin)
-        .add_plugin(JumpyPlayerInputPlugin)
-        .add_plugin(JumpySessionPlugin)
-        .add_plugin(JumpyUiPlugin)
-        .add_plugin(JumpyAudioPlugin)
-        .add_plugin(JumpyPlatformPlugin)
-        .add_plugin(JumpyLoadingPlugin)
-        .add_plugin(JumpyAssetPlugin)
-        .add_plugin(JumpyLocalizationPlugin)
-        .add_plugin(JumpyDebugPlugin)
-        .add_plugin(JumpyConsolePlugin);
+#[derive(HasSchema, Clone, Debug, Default)]
+#[repr(C)]
+pub struct GameMusic {
+    pub title_screen: Handle<AudioSource>,
+    pub fight: SVec<Handle<AudioSource>>,
+    pub character_screen: Handle<AudioSource>,
+    pub results_screen: Handle<AudioSource>,
+    pub credits: Handle<AudioSource>,
+}
 
-    debug!(?engine_config, "Starting game");
+fn main() {
+    // Initialize the Bevy task pool manually so that we can use it during startup.
+    bevy_tasks::IoTaskPool::init(bevy_tasks::TaskPool::new);
 
-    // Get the game handle
-    let asset_server = app.world.get_resource::<AssetServer>().unwrap();
-    let game_asset = &engine_config.game_asset;
-    let game_handle = GameMetaHandle(asset_server.load(game_asset));
+    // Register types that we will load from persistent storage.
+    settings::Settings::register_schema();
 
-    // Insert game handle resource
-    app.world.insert_resource(game_handle);
+    // First create bones game.
+    let mut game = Game::new();
 
-    // Start the game
-    app.run()
+    // Register our game and pack meta types
+    GameMeta::register_schema();
+    PackMeta::register_schema();
+
+    game
+        // Install game plugins
+        .install_plugin(DefaultGamePlugin)
+        .install_plugin(audio::game_plugin)
+        .install_plugin(settings::game_plugin)
+        .install_plugin(fullscreen::game_plugin)
+        .install_plugin(input::game_plugin)
+        .install_plugin(core::game_plugin)
+        .install_plugin(debug::game_plugin)
+        .install_plugin(profiler::game_plugin)
+        // We initialize the asset server and register asset types
+        .init_shared_resource::<AssetServer>()
+        .register_default_assets();
+
+    // Create a new session for the game menu. Each session is it's own bones world with it's own
+    // plugins, systems, and entities.
+    game.sessions.start_menu();
+
+    // Create a new session for the pause menu, which sits in the background by default and only
+    // does anything while the game is running.
+    game.sessions
+        .create(SessionNames::PAUSE_MENU)
+        .install_plugin(ui::pause_menu::session_plugin);
+
+    // Create a bevy renderer for the bones game and run it.
+    BonesBevyRenderer {
+        game,
+        pixel_art: true,
+        game_version: Version::new(
+            env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
+            env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
+            env!("CARGO_PKG_VERSION_PATCH").parse().unwrap(),
+        ),
+        app_namespace: ("org".into(), "fishfolk".into(), "jumpy".into()),
+        asset_dir: std::env::var("JUMPY_ASSETS")
+            .unwrap_or_else(|_| "assets".into())
+            .into(),
+        packs_dir: std::env::var("JUMPY_ASSET_PACKS")
+            .unwrap_or_else(|_| "packs".into())
+            .into(),
+        custom_load_progress: Some(Box::new(load_progress)),
+    }
+    .app()
+    .run();
+}
+
+fn load_progress(assets: &AssetServer, ctx: &egui::Context) {
+    let errored = assets.load_progress.errored();
+    egui::CentralPanel::default()
+        .frame(egui::Frame::default().fill(egui::Color32::from_rgb(0x26, 0x2b, 0x44)))
+        .show(ctx, |ui| {
+            let height = ui.available_height();
+            let ctx = ui.ctx().clone();
+
+            let space_size = 0.03;
+            let spinner_size = 0.10;
+            let text_size = 0.034;
+            ui.vertical_centered(|ui| {
+                ui.add_space(height * 0.3);
+
+                if errored > 0 {
+                    let err_color = egui::Color32::RED;
+                    ui.label(
+                        egui::RichText::new("⚠")
+                            .color(err_color)
+                            .size(height * spinner_size),
+                    );
+                    ui.add_space(height * space_size);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Error loading {errored} asset{}.",
+                            if errored > 1 { "s" } else { "" }
+                        ))
+                        .color(err_color)
+                        .size(height * text_size * 0.75),
+                    );
+                } else {
+                    let rect = ui
+                        .label(
+                            egui::RichText::new("⚓")
+                                .color(egui::Color32::WHITE)
+                                .size(height * spinner_size),
+                        )
+                        .rect;
+                    egui::Spinner::new().paint_at(ui, rect.expand(spinner_size * height * 0.2));
+                    ui.add_space(height * space_size);
+                    ui.label(
+                        egui::RichText::new("Loading")
+                            .color(egui::Color32::WHITE)
+                            .size(height * text_size),
+                    );
+                }
+            });
+
+            ctx.data_mut(|d| {
+                d.insert_temp(ui.id(), (spinner_size, space_size, text_size));
+            })
+        });
 }
